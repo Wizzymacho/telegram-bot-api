@@ -1,0 +1,173 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from datetime import datetime, timedelta
+
+def scrape_tokens(base_url):
+    try:
+        # Send a GET request to the website
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        response = requests.get(base_url, headers=headers)
+        response.raise_for_status()
+
+        # Parse the page content
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Find the relevant section for tokens
+        tokens_data = []
+        token_rows = soup.select('table tbody tr')  # Adjust the selector based on the site's structure
+
+        for row in token_rows:
+            columns = row.find_all('td')
+            if len(columns) > 0:
+                name = columns[0].get_text(strip=True)
+                contract_address = columns[1].get_text(strip=True)  # Assuming the CA is in the second column
+                liquidity = float(columns[2].get_text(strip=True).replace(',', '').replace('$', ''))
+                volume = float(columns[3].get_text(strip=True).replace(',', '').replace('$', ''))
+                age_text = columns[4].get_text(strip=True)  # Age as a string (e.g., '2 days')
+                holders = int(columns[5].get_text(strip=True).replace(',', ''))
+
+                # Convert age to hours
+                if 'day' in age_text:
+                    age_hours = int(age_text.split()[0]) * 24
+                elif 'hour' in age_text:
+                    age_hours = int(age_text.split()[0])
+                else:
+                    age_hours = 0
+
+                # Apply the filtering criteria
+                if liquidity < 100000 and volume < 250000 and age_hours >= 24 and holders <= 300:
+                    tokens_data.append({
+                        "Name": name,
+                        "Contract Address": contract_address,
+                        "Liquidity": liquidity,
+                        "Volume": volume,
+                        "Age (hours)": age_hours,
+                        "Holders": holders
+                    })
+
+        return tokens_data
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching data: {e}")
+        return []
+
+def check_token_safety(contract_address):
+    try:
+        # API endpoint for RugCheck
+        rugcheck_url = "https://rugcheck.xyz/api/check"
+        payload = {"contract_address": contract_address}
+        headers = {"Content-Type": "application/json"}
+
+        response = requests.post(rugcheck_url, json=payload, headers=headers)
+        response.raise_for_status()
+
+        data = response.json()
+        if data.get("score") in ["good", "excellent"]:
+            return data
+        else:
+            return None
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error checking safety for {contract_address}: {e}")
+        return None
+
+def check_twitter_activity(token_name):
+    try:
+        # API endpoint for TweetScout
+        tweetscout_url = "https://tweetscout.io/api/score"
+        payload = {"project_name": token_name}
+        headers = {"Content-Type": "application/json"}
+
+        response = requests.post(tweetscout_url, json=payload, headers=headers)
+        response.raise_for_status()
+
+        data = response.json()
+        twitter_info = {
+            "Engagement Score": data.get("engagement_score", "N/A"),
+            "Top Influencers": data.get("top_influencers", [])[:20]
+        }
+        return twitter_info
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error checking Twitter activity for {token_name}: {e}")
+        return None
+
+def send_to_telegram_bot(token_data, bot_token, chat_id):
+    try:
+        telegram_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        message = (
+            f"Token Alert:\n"
+            f"Name: {token_data['Name']}\n"
+            f"Contract Address: {token_data['Contract Address']}\n"
+            f"Liquidity: ${token_data['Liquidity']}\n"
+            f"Volume: ${token_data['Volume']}\n"
+            f"Age: {token_data['Age (hours)']} hours\n"
+            f"Holders: {token_data['Holders']}\n"
+            f"Engagement Score: {token_data.get('Engagement Score', 'N/A')}\n"
+            f"Top Influencers: {', '.join(token_data.get('Top Influencers', []))}"
+        )
+
+        payload = {
+            "chat_id": chat_id,
+            "text": message
+        }
+
+        response = requests.post(telegram_url, json=payload)
+        response.raise_for_status()
+        print(f"Message sent to Telegram successfully for {token_data['Name']}.")
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error sending message to Telegram: {e}")
+
+def send_to_gmgn_bot(token_data, gmgn_api_url):
+    try:
+        payload = {
+            "contract_address": token_data['Contract Address'],
+            "action": "rapid_purchase"  # Adjust the payload based on the GMGN bot's API requirements
+        }
+
+        response = requests.post(gmgn_api_url, json=payload)
+        response.raise_for_status()
+        print(f"Contract address {token_data['Contract Address']} sent to GMGN bot successfully.")
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error sending contract address to GMGN bot: {e}")
+
+if __name__ == "__main__":
+    url = "https://example.com/tokens"  # Replace with the GMGN URL or target site
+    bot_token = "your_telegram_bot_token"  # Replace with your Telegram bot token
+    chat_id = "your_chat_id"  # Replace with your Telegram chat ID
+    gmgn_api_url = "https://gmgn.bot/api"  # Replace with the GMGN bot API URL
+
+    tokens = scrape_tokens(url)
+
+    if tokens:
+        # Filter tokens through RugCheck
+        safe_tokens = []
+
+        for token in tokens:
+            safety_report = check_token_safety(token["Contract Address"])
+            if safety_report:
+                twitter_info = check_twitter_activity(token["Name"])
+                if twitter_info:
+                    token.update(safety_report)
+                    token.update(twitter_info)
+                    safe_tokens.append(token)
+                    send_to_telegram_bot(token, bot_token, chat_id)
+                    send_to_gmgn_bot(token, gmgn_api_url)
+
+        if safe_tokens:
+            # Convert to a DataFrame for better readability
+            df = pd.DataFrame(safe_tokens)
+            print(df)
+
+            # Optionally save to a CSV file
+            df.to_csv("safe_tokens_with_twitter.csv", index=False)
+            print("Data saved to safe_tokens_with_twitter.csv")
+        else:
+            print("No safe tokens found.")
+    else:
+        print("No data found.")
